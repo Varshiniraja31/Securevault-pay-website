@@ -1,14 +1,17 @@
 import { useEffect, useState } from "react";
 import { useNavigate } from "react-router-dom";
-import { Phone, Mail, KeyRound, ArrowRight, Smartphone, ChevronLeft, Check } from "lucide-react";
+import { Phone, Mail, KeyRound, ArrowRight, Smartphone, ChevronLeft, Check, Lock, Delete } from "lucide-react";
 import AuthLayout from "../components/AuthLayout";
 import { AuthLabel, AuthInput } from "../components/AuthInput";
 import OtpInput from "../components/OtpInput";
 import { useAuth } from "../context/AuthContext";
 import { useToast } from "../context/ToastContext";
+import { verifyPinLogin } from "../api/auth";
 
 const OTP_LENGTH = 6;
 const RESEND_SECONDS = 30;
+const PIN_LENGTH = 4;
+const PIN_KEYS = ["1", "2", "3", "4", "5", "6", "7", "8", "9", "", "0", "delete"];
 
 function generateOtp() {
   return String(Math.floor(100000 + Math.random() * 900000));
@@ -28,6 +31,10 @@ export default function Login() {
   const [otp, setOtp] = useState("");
   const [expectedOtp, setExpectedOtp] = useState("");
   const [secondsLeft, setSecondsLeft] = useState(RESEND_SECONDS);
+
+  const [pin, setPin] = useState("");
+  const [pinError, setPinError] = useState("");
+  const [verifyingPin, setVerifyingPin] = useState(false);
 
   useEffect(() => {
     if (step !== "otp" || secondsLeft <= 0) return;
@@ -60,6 +67,8 @@ export default function Login() {
       if (session.user.twoFactorEnabled) {
         sendOtp();
         setStep("otp");
+      } else if (session.user.pinEnabled) {
+        setStep("pin");
       } else {
         await finishLogin(session);
       }
@@ -78,7 +87,37 @@ export default function Login() {
       return;
     }
     setError("");
-    await finishLogin(pendingSession);
+    if (pendingSession.user.pinEnabled) {
+      setStep("pin");
+    } else {
+      await finishLogin(pendingSession);
+    }
+  }
+
+  async function handlePinDigit(key) {
+    if (verifyingPin) return;
+    if (key === "delete") {
+      setPin((p) => p.slice(0, -1));
+      setPinError("");
+      return;
+    }
+    if (!key || pin.length >= PIN_LENGTH) return;
+    setPinError("");
+
+    const next = pin + key;
+    setPin(next);
+
+    if (next.length === PIN_LENGTH) {
+      setVerifyingPin(true);
+      try {
+        await verifyPinLogin(pendingSession.user.id, next);
+        await finishLogin(pendingSession);
+      } catch (err) {
+        setPinError(err.message);
+        setPin("");
+        setVerifyingPin(false);
+      }
+    }
   }
 
   if (step === "verified") {
@@ -138,6 +177,59 @@ export default function Login() {
             </button>
           )}
         </p>
+      </AuthLayout>
+    );
+  }
+
+  if (step === "pin") {
+    return (
+      <AuthLayout icon={null}>
+        <button
+          onClick={() => setStep(pendingSession.user.twoFactorEnabled ? "otp" : "credentials")}
+          className="mb-6 flex h-9 w-9 items-center justify-center rounded-full bg-white/5 text-gray-400 hover:bg-white/10 hover:text-white"
+        >
+          <ChevronLeft size={18} />
+        </button>
+
+        <div className="flex flex-col items-center text-center">
+          <div className="flex h-16 w-16 items-center justify-center rounded-2xl bg-[#2a0f0f] text-red-500">
+            <Lock size={28} />
+          </div>
+          <h1 className="mt-5 text-3xl font-bold text-white">Enter your PIN</h1>
+          <p className="mt-2 text-sm text-gray-500">
+            Enter your {PIN_LENGTH}-digit PIN to unlock your account
+          </p>
+
+          <div className="mt-8 flex justify-center gap-4">
+            {Array.from({ length: PIN_LENGTH }).map((_, i) => (
+              <span
+                key={i}
+                className={`h-4 w-4 rounded-full border-2 transition-colors ${
+                  i < pin.length ? "border-red-500 bg-red-500" : "border-white/20"
+                }`}
+              />
+            ))}
+          </div>
+
+          {pinError && <p className="mt-3 text-sm text-red-400">{pinError}</p>}
+
+          <div className="mt-10 grid grid-cols-3 gap-4">
+            {PIN_KEYS.map((key, i) =>
+              key === "" ? (
+                <div key={i} />
+              ) : (
+                <button
+                  key={i}
+                  onClick={() => handlePinDigit(key)}
+                  disabled={verifyingPin}
+                  className="flex h-16 w-16 items-center justify-center rounded-full bg-[#131313] text-xl font-semibold text-white transition hover:bg-[#1e1e1e] disabled:opacity-50"
+                >
+                  {key === "delete" ? <Delete size={20} /> : key}
+                </button>
+              )
+            )}
+          </div>
+        </div>
       </AuthLayout>
     );
   }

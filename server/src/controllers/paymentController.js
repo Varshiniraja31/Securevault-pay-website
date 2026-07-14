@@ -1,4 +1,9 @@
-import { sequelize, Wallet, Transaction, Notification } from "../models/index.js";
+import { db } from "../config/firebase.js";
+import { docToObject, snapshotToArray } from "../utils/firestore.js";
+
+const walletsCol = db.collection("wallets");
+const transactionsCol = db.collection("transactions");
+const notificationsCol = db.collection("notifications");
 
 const TYPE_LABEL = {
   merchant_payment: "Merchant payment",
@@ -17,14 +22,16 @@ export async function makePayment(req, res) {
     return res.status(400).json({ message: "walletId and a positive amount are required" });
   }
 
-  const result = await sequelize.transaction(async (t) => {
-    const wallet = await Wallet.findOne({
-      where: { id: walletId, userId: req.userId },
-      lock: t.LOCK.UPDATE,
-      transaction: t,
-    });
+  const walletRef = walletsCol.doc(walletId);
+  const txnRef = transactionsCol.doc();
+  const now = new Date().toISOString();
 
-    if (!wallet) throw Object.assign(new Error("Wallet not found"), { status: 404 });
+  const result = await db.runTransaction(async (t) => {
+    const walletSnap = await t.get(walletRef);
+    if (!walletSnap.exists || walletSnap.data().userId !== req.userId) {
+      throw Object.assign(new Error("Wallet not found"), { status: 404 });
+    }
+    const wallet = docToObject(walletSnap);
     if (Number(wallet.balance) < amt) {
       throw Object.assign(
         new Error(`Insufficient balance in ${wallet.name}. Top it up from your Main Wallet first.`),
@@ -32,30 +39,31 @@ export async function makePayment(req, res) {
       );
     }
 
-    wallet.balance = Number(wallet.balance) - amt;
-    await wallet.save({ transaction: t });
+    const newBalance = Number(wallet.balance) - amt;
+    t.update(walletRef, { balance: newBalance });
 
-    const txn = await Transaction.create(
-      {
-        userId: req.userId,
-        type: paymentType,
-        fromWalletId: walletId,
-        amount: amt,
-        merchantName: merchantName || "Merchant",
-        note: note || null,
-        status: "success",
-      },
-      { transaction: t }
-    );
+    const txnData = {
+      userId: req.userId,
+      type: paymentType,
+      fromWalletId: walletId,
+      amount: amt,
+      merchantName: merchantName || "Merchant",
+      note: note || null,
+      status: "success",
+      createdAt: now,
+    };
+    t.set(txnRef, txnData);
 
-    return { wallet, txn };
+    return { wallet: { ...wallet, balance: newBalance }, txn: { id: txnRef.id, ...txnData } };
   });
 
-  await Notification.create({
+  await notificationsCol.doc().set({
     userId: req.userId,
     title: TYPE_LABEL[paymentType],
     message: `₹${amt.toFixed(2)} paid to ${merchantName || "merchant"} from ${result.wallet.name}.`,
     type: "payment",
+    isRead: false,
+    createdAt: now,
   });
 
   res.json(result);
@@ -63,18 +71,16 @@ export async function makePayment(req, res) {
 
 export async function listTransactions(req, res) {
   const { walletId, limit } = req.query;
-  const where = { userId: req.userId };
 
-  const { Op } = await import("sequelize");
+  const snap = await transactionsCol.where("userId", "==", req.userId).get();
+  let transactions = snapshotToArray(snap);
+
   if (walletId) {
-    where[Op.or] = [{ fromWalletId: walletId }, { toWalletId: walletId }];
+    transactions = transactions.filter((t) => t.fromWalletId === walletId || t.toWalletId === walletId);
   }
 
-  const transactions = await Transaction.findAll({
-    where,
-    order: [["createdAt", "DESC"]],
-    limit: limit ? Number(limit) : 100,
-  });
+  transactions.sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
+  transactions = transactions.slice(0, limit ? Number(limit) : 100);
 
   res.json({ transactions });
 }

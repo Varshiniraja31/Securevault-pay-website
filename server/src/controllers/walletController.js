@@ -1,12 +1,21 @@
-import { sequelize, Wallet, Transaction, Notification } from "../models/index.js";
+import { db } from "../config/firebase.js";
+import { docToObject, snapshotToArray } from "../utils/firestore.js";
 import { WALLET_CATEGORIES } from "../utils/categories.js";
 
-export async function listWallets(req, res) {
-  const wallets = await Wallet.findAll({
-    where: { userId: req.userId },
-    order: [["type", "DESC"], ["createdAt", "ASC"]],
+const walletsCol = db.collection("wallets");
+const transactionsCol = db.collection("transactions");
+const notificationsCol = db.collection("notifications");
+
+function sortWallets(wallets) {
+  return wallets.sort((a, b) => {
+    if (a.type !== b.type) return a.type === "main" ? -1 : 1;
+    return new Date(a.createdAt) - new Date(b.createdAt);
   });
-  res.json({ wallets });
+}
+
+export async function listWallets(req, res) {
+  const snap = await walletsCol.where("userId", "==", req.userId).get();
+  res.json({ wallets: sortWallets(snapshotToArray(snap)) });
 }
 
 export async function createWallet(req, res) {
@@ -15,7 +24,8 @@ export async function createWallet(req, res) {
 
   const meta = WALLET_CATEGORIES[category] || WALLET_CATEGORIES.custom;
 
-  const wallet = await Wallet.create({
+  const ref = walletsCol.doc();
+  const walletData = {
     userId: req.userId,
     type: "purpose",
     name,
@@ -24,21 +34,27 @@ export async function createWallet(req, res) {
     budget: budget ? Number(budget) : null,
     color: meta.color,
     icon: meta.icon,
-  });
+    createdAt: new Date().toISOString(),
+  };
+  await ref.set(walletData);
 
-  res.status(201).json({ wallet });
+  res.status(201).json({ wallet: { id: ref.id, ...walletData } });
 }
 
 export async function deleteWallet(req, res) {
-  const wallet = await Wallet.findOne({ where: { id: req.params.id, userId: req.userId } });
-  if (!wallet) return res.status(404).json({ message: "Wallet not found" });
+  const ref = walletsCol.doc(req.params.id);
+  const doc = await ref.get();
+  if (!doc.exists || doc.data().userId !== req.userId) {
+    return res.status(404).json({ message: "Wallet not found" });
+  }
+  const wallet = docToObject(doc);
   if (wallet.type === "main") {
     return res.status(400).json({ message: "The Main Wallet cannot be deleted" });
   }
   if (Number(wallet.balance) > 0) {
     return res.status(400).json({ message: "Move remaining funds out before deleting this wallet" });
   }
-  await wallet.destroy();
+  await ref.delete();
   res.json({ message: "Wallet deleted" });
 }
 
@@ -54,51 +70,62 @@ export async function transferBetweenWallets(req, res) {
     return res.status(400).json({ message: "Source and destination wallets must be different" });
   }
 
-  const result = await sequelize.transaction(async (t) => {
-    const fromWallet = await Wallet.findOne({
-      where: { id: fromWalletId, userId: req.userId },
-      lock: t.LOCK.UPDATE,
-      transaction: t,
-    });
-    const toWallet = await Wallet.findOne({
-      where: { id: toWalletId, userId: req.userId },
-      lock: t.LOCK.UPDATE,
-      transaction: t,
-    });
+  const fromRef = walletsCol.doc(fromWalletId);
+  const toRef = walletsCol.doc(toWalletId);
+  const txnRef = transactionsCol.doc();
+  const now = new Date().toISOString();
 
-    if (!fromWallet || !toWallet) {
+  const result = await db.runTransaction(async (t) => {
+    const [fromSnap, toSnap] = await Promise.all([t.get(fromRef), t.get(toRef)]);
+
+    if (
+      !fromSnap.exists ||
+      !toSnap.exists ||
+      fromSnap.data().userId !== req.userId ||
+      toSnap.data().userId !== req.userId
+    ) {
       throw Object.assign(new Error("One or both wallets were not found"), { status: 404 });
     }
+
+    const fromWallet = docToObject(fromSnap);
+    const toWallet = docToObject(toSnap);
+
     if (Number(fromWallet.balance) < amt) {
       throw Object.assign(new Error("Insufficient balance in the source wallet"), { status: 400 });
     }
 
-    fromWallet.balance = Number(fromWallet.balance) - amt;
-    toWallet.balance = Number(toWallet.balance) + amt;
-    await fromWallet.save({ transaction: t });
-    await toWallet.save({ transaction: t });
+    const newFromBalance = Number(fromWallet.balance) - amt;
+    const newToBalance = Number(toWallet.balance) + amt;
 
-    const txn = await Transaction.create(
-      {
-        userId: req.userId,
-        type: "wallet_transfer",
-        fromWalletId,
-        toWalletId,
-        amount: amt,
-        note: note || null,
-        status: "success",
-      },
-      { transaction: t }
-    );
+    t.update(fromRef, { balance: newFromBalance });
+    t.update(toRef, { balance: newToBalance });
 
-    return { fromWallet, toWallet, txn };
+    const txnData = {
+      userId: req.userId,
+      type: "wallet_transfer",
+      fromWalletId,
+      toWalletId,
+      amount: amt,
+      note: note || null,
+      status: "success",
+      createdAt: now,
+    };
+    t.set(txnRef, txnData);
+
+    return {
+      fromWallet: { ...fromWallet, balance: newFromBalance },
+      toWallet: { ...toWallet, balance: newToBalance },
+      txn: { id: txnRef.id, ...txnData },
+    };
   });
 
-  await Notification.create({
+  await notificationsCol.doc().set({
     userId: req.userId,
     title: "Wallet transfer complete",
     message: `₹${amt.toFixed(2)} moved from ${result.fromWallet.name} to ${result.toWallet.name}.`,
     type: "wallet",
+    isRead: false,
+    createdAt: now,
   });
 
   res.json(result);
@@ -110,29 +137,38 @@ export async function topUpMainWallet(req, res) {
   const amt = Number(amount);
   if (!amt || amt <= 0) return res.status(400).json({ message: "A positive amount is required" });
 
-  const wallet = await Wallet.findOne({ where: { userId: req.userId, type: "main" } });
-  if (!wallet) return res.status(404).json({ message: "Main Wallet not found" });
+  const snap = await walletsCol.where("userId", "==", req.userId).where("type", "==", "main").limit(1).get();
+  if (snap.empty) return res.status(404).json({ message: "Main Wallet not found" });
 
-  wallet.balance = Number(wallet.balance) + amt;
-  await wallet.save();
+  const walletDoc = snap.docs[0];
+  const wallet = docToObject(walletDoc);
+  const newBalance = Number(wallet.balance) + amt;
+  const now = new Date().toISOString();
 
-  const txn = await Transaction.create({
+  await walletDoc.ref.update({ balance: newBalance });
+
+  const txnRef = transactionsCol.doc();
+  const txnData = {
     userId: req.userId,
     type: "topup",
-    toWalletId: wallet.id,
+    toWalletId: walletDoc.id,
     amount: amt,
     note: note || "Added money",
     status: "success",
-  });
+    createdAt: now,
+  };
+  await txnRef.set(txnData);
 
-  await Notification.create({
+  await notificationsCol.doc().set({
     userId: req.userId,
     title: "Money added",
     message: `₹${amt.toFixed(2)} added to your Main Wallet.`,
     type: "wallet",
+    isRead: false,
+    createdAt: now,
   });
 
-  res.json({ wallet, txn });
+  res.json({ wallet: { ...wallet, balance: newBalance }, txn: { id: txnRef.id, ...txnData } });
 }
 
 // Simulated withdrawal from the Main Wallet (e.g., to a bank account)
@@ -141,30 +177,39 @@ export async function withdrawFromMainWallet(req, res) {
   const amt = Number(amount);
   if (!amt || amt <= 0) return res.status(400).json({ message: "A positive amount is required" });
 
-  const wallet = await Wallet.findOne({ where: { userId: req.userId, type: "main" } });
-  if (!wallet) return res.status(404).json({ message: "Main Wallet not found" });
+  const snap = await walletsCol.where("userId", "==", req.userId).where("type", "==", "main").limit(1).get();
+  if (snap.empty) return res.status(404).json({ message: "Main Wallet not found" });
+
+  const walletDoc = snap.docs[0];
+  const wallet = docToObject(walletDoc);
   if (Number(wallet.balance) < amt) {
     return res.status(400).json({ message: "Insufficient balance in the Main Wallet" });
   }
+  const newBalance = Number(wallet.balance) - amt;
+  const now = new Date().toISOString();
 
-  wallet.balance = Number(wallet.balance) - amt;
-  await wallet.save();
+  await walletDoc.ref.update({ balance: newBalance });
 
-  const txn = await Transaction.create({
+  const txnRef = transactionsCol.doc();
+  const txnData = {
     userId: req.userId,
     type: "withdrawal",
-    fromWalletId: wallet.id,
+    fromWalletId: walletDoc.id,
     amount: amt,
     note: note || "Withdrawn to bank",
     status: "success",
-  });
+    createdAt: now,
+  };
+  await txnRef.set(txnData);
 
-  await Notification.create({
+  await notificationsCol.doc().set({
     userId: req.userId,
     title: "Money withdrawn",
     message: `₹${amt.toFixed(2)} withdrawn from your Main Wallet.`,
     type: "wallet",
+    isRead: false,
+    createdAt: now,
   });
 
-  res.json({ wallet, txn });
+  res.json({ wallet: { ...wallet, balance: newBalance }, txn: { id: txnRef.id, ...txnData } });
 }

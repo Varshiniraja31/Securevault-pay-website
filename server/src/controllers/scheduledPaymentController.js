@@ -1,10 +1,15 @@
-import { ScheduledPayment, Wallet, Notification } from "../models/index.js";
+import { db } from "../config/firebase.js";
+import { docToObject, snapshotToArray } from "../utils/firestore.js";
+
+const walletsCol = db.collection("wallets");
+const scheduledPaymentsCol = db.collection("scheduledPayments");
+const notificationsCol = db.collection("notifications");
 
 export async function listScheduledPayments(req, res) {
-  const scheduledPayments = await ScheduledPayment.findAll({
-    where: { userId: req.userId },
-    order: [["nextRunDate", "ASC"]],
-  });
+  const snap = await scheduledPaymentsCol.where("userId", "==", req.userId).get();
+  const scheduledPayments = snapshotToArray(snap).sort(
+    (a, b) => new Date(a.nextRunDate) - new Date(b.nextRunDate)
+  );
   res.json({ scheduledPayments });
 }
 
@@ -31,10 +36,14 @@ export async function createScheduledPayment(req, res) {
     return res.status(400).json({ message: "Frequency is required for recurring payments" });
   }
 
-  const wallet = await Wallet.findOne({ where: { id: fromWalletId, userId: req.userId } });
-  if (!wallet) return res.status(404).json({ message: "Source wallet not found" });
+  const walletDoc = await walletsCol.doc(fromWalletId).get();
+  if (!walletDoc.exists || walletDoc.data().userId !== req.userId) {
+    return res.status(404).json({ message: "Source wallet not found" });
+  }
 
-  const scheduledPayment = await ScheduledPayment.create({
+  const ref = scheduledPaymentsCol.doc();
+  const now = new Date().toISOString();
+  const data = {
     userId: req.userId,
     fromWalletId,
     payeeName,
@@ -46,23 +55,30 @@ export async function createScheduledPayment(req, res) {
     endDate: endDate || null,
     note: note || null,
     status: "active",
-  });
+    lastRunDate: null,
+    createdAt: now,
+  };
+  await ref.set(data);
 
-  await Notification.create({
+  await notificationsCol.doc().set({
     userId: req.userId,
     title: "Payment scheduled",
     message: `₹${amt.toFixed(2)} to ${payeeName} scheduled for ${nextRunDate}.`,
     type: "schedule",
+    isRead: false,
+    createdAt: now,
   });
 
-  res.status(201).json({ scheduledPayment });
+  res.status(201).json({ scheduledPayment: { id: ref.id, ...data } });
 }
 
 export async function updateScheduledPayment(req, res) {
-  const scheduledPayment = await ScheduledPayment.findOne({
-    where: { id: req.params.id, userId: req.userId },
-  });
-  if (!scheduledPayment) return res.status(404).json({ message: "Scheduled payment not found" });
+  const ref = scheduledPaymentsCol.doc(req.params.id);
+  const doc = await ref.get();
+  if (!doc.exists || doc.data().userId !== req.userId) {
+    return res.status(404).json({ message: "Scheduled payment not found" });
+  }
+  const scheduledPayment = docToObject(doc);
   if (["completed", "cancelled"].includes(scheduledPayment.status)) {
     return res.status(400).json({ message: "This scheduled payment can no longer be edited" });
   }
@@ -79,33 +95,39 @@ export async function updateScheduledPayment(req, res) {
     note,
   } = req.body;
 
+  const updates = {};
+
   if (fromWalletId) {
-    const wallet = await Wallet.findOne({ where: { id: fromWalletId, userId: req.userId } });
-    if (!wallet) return res.status(404).json({ message: "Source wallet not found" });
-    scheduledPayment.fromWalletId = fromWalletId;
+    const walletDoc = await walletsCol.doc(fromWalletId).get();
+    if (!walletDoc.exists || walletDoc.data().userId !== req.userId) {
+      return res.status(404).json({ message: "Source wallet not found" });
+    }
+    updates.fromWalletId = fromWalletId;
   }
-  if (payeeName) scheduledPayment.payeeName = payeeName;
-  if (category) scheduledPayment.category = category;
+  if (payeeName) updates.payeeName = payeeName;
+  if (category) updates.category = category;
   if (amount) {
     const amt = Number(amount);
     if (!amt || amt <= 0) return res.status(400).json({ message: "A positive amount is required" });
-    scheduledPayment.amount = amt;
+    updates.amount = amt;
   }
   if (scheduleType) {
-    if (scheduleType === "recurring" && !(frequency || scheduledPayment.frequency)) {
+    const effectiveFrequency = frequency || scheduledPayment.frequency;
+    if (scheduleType === "recurring" && !effectiveFrequency) {
       return res.status(400).json({ message: "Frequency is required for recurring payments" });
     }
-    scheduledPayment.scheduleType = scheduleType;
-    scheduledPayment.frequency = scheduleType === "recurring" ? frequency || scheduledPayment.frequency : null;
+    updates.scheduleType = scheduleType;
+    updates.frequency = scheduleType === "recurring" ? effectiveFrequency : null;
   } else if (frequency) {
-    scheduledPayment.frequency = frequency;
+    updates.frequency = frequency;
   }
-  if (nextRunDate) scheduledPayment.nextRunDate = nextRunDate;
-  if (endDate !== undefined) scheduledPayment.endDate = endDate || null;
-  if (note !== undefined) scheduledPayment.note = note || null;
+  if (nextRunDate) updates.nextRunDate = nextRunDate;
+  if (endDate !== undefined) updates.endDate = endDate || null;
+  if (note !== undefined) updates.note = note || null;
 
-  await scheduledPayment.save();
-  res.json({ scheduledPayment });
+  await ref.update(updates);
+  const updated = await ref.get();
+  res.json({ scheduledPayment: docToObject(updated) });
 }
 
 export async function updateScheduledPaymentStatus(req, res) {
@@ -114,25 +136,26 @@ export async function updateScheduledPaymentStatus(req, res) {
     return res.status(400).json({ message: "Invalid status" });
   }
 
-  const scheduledPayment = await ScheduledPayment.findOne({
-    where: { id: req.params.id, userId: req.userId },
-  });
-  if (!scheduledPayment) return res.status(404).json({ message: "Scheduled payment not found" });
-  if (scheduledPayment.status === "completed") {
+  const ref = scheduledPaymentsCol.doc(req.params.id);
+  const doc = await ref.get();
+  if (!doc.exists || doc.data().userId !== req.userId) {
+    return res.status(404).json({ message: "Scheduled payment not found" });
+  }
+  if (doc.data().status === "completed") {
     return res.status(400).json({ message: "This scheduled payment has already completed" });
   }
 
-  scheduledPayment.status = status;
-  await scheduledPayment.save();
-
-  res.json({ scheduledPayment });
+  await ref.update({ status });
+  const updated = await ref.get();
+  res.json({ scheduledPayment: docToObject(updated) });
 }
 
 export async function deleteScheduledPayment(req, res) {
-  const scheduledPayment = await ScheduledPayment.findOne({
-    where: { id: req.params.id, userId: req.userId },
-  });
-  if (!scheduledPayment) return res.status(404).json({ message: "Scheduled payment not found" });
-  await scheduledPayment.destroy();
+  const ref = scheduledPaymentsCol.doc(req.params.id);
+  const doc = await ref.get();
+  if (!doc.exists || doc.data().userId !== req.userId) {
+    return res.status(404).json({ message: "Scheduled payment not found" });
+  }
+  await ref.delete();
   res.json({ message: "Scheduled payment deleted" });
 }

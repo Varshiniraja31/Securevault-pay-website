@@ -1,6 +1,11 @@
 import cron from "node-cron";
-import { Op } from "sequelize";
-import { sequelize, ScheduledPayment, Wallet, Transaction, Notification } from "../models/index.js";
+import { db } from "../config/firebase.js";
+import { docToObject, snapshotToArray } from "../utils/firestore.js";
+
+const walletsCol = db.collection("wallets");
+const transactionsCol = db.collection("transactions");
+const notificationsCol = db.collection("notifications");
+const scheduledPaymentsCol = db.collection("scheduledPayments");
 
 function todayDateOnly() {
   return new Date().toISOString().slice(0, 10);
@@ -17,89 +22,80 @@ function computeNextRunDate(currentDate, frequency) {
 
 async function executePayment(scheduledPayment) {
   const today = todayDateOnly();
+  const now = new Date().toISOString();
+  const walletRef = walletsCol.doc(scheduledPayment.fromWalletId);
 
-  try {
-    await sequelize.transaction(async (t) => {
-      const wallet = await Wallet.findOne({
-        where: { id: scheduledPayment.fromWalletId },
-        lock: t.LOCK.UPDATE,
-        transaction: t,
+  await db.runTransaction(async (t) => {
+    const walletSnap = await t.get(walletRef);
+    const wallet = walletSnap.exists ? docToObject(walletSnap) : null;
+
+    if (!wallet || Number(wallet.balance) < Number(scheduledPayment.amount)) {
+      t.set(transactionsCol.doc(), {
+        userId: scheduledPayment.userId,
+        type: "scheduled_payment",
+        fromWalletId: scheduledPayment.fromWalletId,
+        amount: scheduledPayment.amount,
+        merchantName: scheduledPayment.payeeName,
+        note: scheduledPayment.note,
+        status: "failed",
+        createdAt: now,
       });
-
-      if (!wallet || Number(wallet.balance) < Number(scheduledPayment.amount)) {
-        await Transaction.create(
-          {
-            userId: scheduledPayment.userId,
-            type: "scheduled_payment",
-            fromWalletId: scheduledPayment.fromWalletId,
-            amount: scheduledPayment.amount,
-            merchantName: scheduledPayment.payeeName,
-            note: scheduledPayment.note,
-            status: "failed",
-          },
-          { transaction: t }
-        );
-        await Notification.create(
-          {
-            userId: scheduledPayment.userId,
-            title: "Scheduled payment failed",
-            message: `₹${Number(scheduledPayment.amount).toFixed(2)} to ${scheduledPayment.payeeName} could not be processed due to insufficient balance.`,
-            type: "schedule",
-          },
-          { transaction: t }
-        );
-        return;
-      }
-
-      wallet.balance = Number(wallet.balance) - Number(scheduledPayment.amount);
-      await wallet.save({ transaction: t });
-
-      await Transaction.create(
-        {
-          userId: scheduledPayment.userId,
-          type: "scheduled_payment",
-          fromWalletId: scheduledPayment.fromWalletId,
-          amount: scheduledPayment.amount,
-          merchantName: scheduledPayment.payeeName,
-          note: scheduledPayment.note,
-          status: "success",
-        },
-        { transaction: t }
-      );
-
-      await Notification.create(
-        {
-          userId: scheduledPayment.userId,
-          title: "Scheduled payment sent",
-          message: `₹${Number(scheduledPayment.amount).toFixed(2)} sent to ${scheduledPayment.payeeName}.`,
-          type: "schedule",
-        },
-        { transaction: t }
-      );
-    });
-  } finally {
-    scheduledPayment.lastRunDate = today;
-
-    if (scheduledPayment.scheduleType === "recurring") {
-      const next = computeNextRunDate(scheduledPayment.nextRunDate, scheduledPayment.frequency);
-      if (scheduledPayment.endDate && next > scheduledPayment.endDate) {
-        scheduledPayment.status = "completed";
-      } else {
-        scheduledPayment.nextRunDate = next;
-      }
-    } else {
-      scheduledPayment.status = "completed";
+      t.set(notificationsCol.doc(), {
+        userId: scheduledPayment.userId,
+        title: "Scheduled payment failed",
+        message: `₹${Number(scheduledPayment.amount).toFixed(2)} to ${scheduledPayment.payeeName} could not be processed due to insufficient balance.`,
+        type: "schedule",
+        isRead: false,
+        createdAt: now,
+      });
+      return;
     }
 
-    await scheduledPayment.save();
+    t.update(walletRef, { balance: Number(wallet.balance) - Number(scheduledPayment.amount) });
+
+    t.set(transactionsCol.doc(), {
+      userId: scheduledPayment.userId,
+      type: "scheduled_payment",
+      fromWalletId: scheduledPayment.fromWalletId,
+      amount: scheduledPayment.amount,
+      merchantName: scheduledPayment.payeeName,
+      note: scheduledPayment.note,
+      status: "success",
+      createdAt: now,
+    });
+
+    t.set(notificationsCol.doc(), {
+      userId: scheduledPayment.userId,
+      title: "Scheduled payment sent",
+      message: `₹${Number(scheduledPayment.amount).toFixed(2)} sent to ${scheduledPayment.payeeName}.`,
+      type: "schedule",
+      isRead: false,
+      createdAt: now,
+    });
+  });
+
+  const updates = { lastRunDate: today };
+
+  if (scheduledPayment.scheduleType === "recurring") {
+    const next = computeNextRunDate(scheduledPayment.nextRunDate, scheduledPayment.frequency);
+    if (scheduledPayment.endDate && next > scheduledPayment.endDate) {
+      updates.status = "completed";
+    } else {
+      updates.nextRunDate = next;
+    }
+  } else {
+    updates.status = "completed";
   }
+
+  await scheduledPaymentsCol.doc(scheduledPayment.id).update(updates);
 }
 
 export async function runDuePayments() {
   const today = todayDateOnly();
-  const due = await ScheduledPayment.findAll({
-    where: { status: "active", nextRunDate: { [Op.lte]: today } },
-  });
+  // Fetch all active schedules (single equality filter avoids needing a composite
+  // index for status + nextRunDate) and filter the date range in JS.
+  const snap = await scheduledPaymentsCol.where("status", "==", "active").get();
+  const due = snapshotToArray(snap).filter((p) => p.nextRunDate <= today);
 
   for (const payment of due) {
     await executePayment(payment);

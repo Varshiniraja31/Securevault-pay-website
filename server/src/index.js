@@ -1,9 +1,7 @@
 import "dotenv/config";
 import express from "express";
 import cors from "cors";
-import { sequelize } from "./models/index.js";
 import { startScheduler } from "./jobs/scheduler.js";
-import { ensureColumn } from "./utils/migrate.js";
 
 import authRoutes from "./routes/authRoutes.js";
 import walletRoutes from "./routes/walletRoutes.js";
@@ -30,14 +28,10 @@ app.use((err, req, res, next) => {
   res.status(err.status || 500).json({ message: err.message || "Something went wrong" });
 });
 
-async function start() {
-  await sequelize.sync();
-  await ensureColumn(sequelize, "Users", "twoFactorEnabled", "BOOLEAN DEFAULT 1");
-  await ensureColumn(sequelize, "Users", "pinHash", "VARCHAR(255)");
-  await ensureColumn(sequelize, "Users", "pinEnabled", "BOOLEAN DEFAULT 0");
+function start() {
   startScheduler();
   app.listen(PORT, () => {
-    console.log(`SecureVault Pay API running on http://localhost:${PORT}`);
+    console.log(`SecureVault Pay API (Firestore) running on http://localhost:${PORT}`);
   });
 }
 
