@@ -16,6 +16,7 @@ function tomorrow() {
 const EMPTY_FORM = {
   fromWalletId: "",
   payeeName: "",
+  payeePhone: "",
   category: "rent",
   customCategory: "",
   amount: "",
@@ -27,7 +28,7 @@ const EMPTY_FORM = {
 };
 
 export default function ScheduleFormModal({ open, onClose, editingPayment }) {
-  const { wallets, refreshScheduledPayments } = useData();
+  const { wallets, refreshScheduledPayments, refreshWallets, refreshTransactions } = useData();
   const toast = useToast();
   const isEditing = Boolean(editingPayment);
   const [form, setForm] = useState(EMPTY_FORM);
@@ -44,6 +45,7 @@ export default function ScheduleFormModal({ open, onClose, editingPayment }) {
       setForm({
         fromWalletId: editingPayment.fromWalletId,
         payeeName: editingPayment.payeeName,
+        payeePhone: editingPayment.payeePhone || "",
         category: knownCategory ? editingPayment.category : "custom",
         customCategory: knownCategory ? "" : editingPayment.category,
         amount: String(editingPayment.amount),
@@ -81,9 +83,13 @@ export default function ScheduleFormModal({ open, onClose, editingPayment }) {
         toast.success(`Payment to ${form.payeeName} updated`);
       } else {
         await createScheduledPayment(payload);
-        toast.success(`Payment to ${form.payeeName} scheduled`);
+        toast.success(
+          payload.scheduleType === "recurring"
+            ? `Payment to ${form.payeeName} scheduled`
+            : `₹${payload.amount.toFixed(2)} reserved and scheduled for ${form.payeeName}`
+        );
       }
-      await refreshScheduledPayments();
+      await Promise.all([refreshScheduledPayments(), refreshWallets(), refreshTransactions()]);
       onClose();
     } catch (err) {
       setError(err.message);
@@ -113,6 +119,15 @@ export default function ScheduleFormModal({ open, onClose, editingPayment }) {
             placeholder="e.g. Landlord, Netflix, Mom"
             value={form.payeeName}
             onChange={(e) => setForm({ ...form, payeeName: e.target.value })}
+          />
+        </Field>
+        <Field label="Phone number" hint="Optional">
+          <Input
+            type="tel"
+            prefix="+91"
+            placeholder="Enter payee's mobile number"
+            value={form.payeePhone}
+            onChange={(e) => setForm({ ...form, payeePhone: e.target.value })}
           />
         </Field>
         <Field label="Category">

@@ -17,6 +17,8 @@ const TYPE_META = {
   qr_payment: { label: "QR Payment", icon: ScanLine, positive: false, color: "#3b82f6" },
   bill_payment: { label: "Bill Payment", icon: Zap, positive: false, color: "#f59e0b" },
   scheduled_payment: { label: "Scheduled Payment", icon: CalendarClock, positive: false, color: "#ef4444" },
+  schedule_reserve: { label: "Payment Reserved", icon: CalendarClock, positive: false, color: "#f59e0b" },
+  schedule_refund: { label: "Schedule Refund", icon: ArrowDownLeft, positive: true, color: "#22c55e" },
   received: { label: "Received", icon: ArrowDownLeft, positive: true, color: "#22c55e" },
 };
 

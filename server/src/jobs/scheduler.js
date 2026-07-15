@@ -25,35 +25,10 @@ async function executePayment(scheduledPayment) {
   const now = new Date().toISOString();
   const walletRef = walletsCol.doc(scheduledPayment.fromWalletId);
 
-  await db.runTransaction(async (t) => {
-    const walletSnap = await t.get(walletRef);
-    const wallet = walletSnap.exists ? docToObject(walletSnap) : null;
-
-    if (!wallet || Number(wallet.balance) < Number(scheduledPayment.amount)) {
-      t.set(transactionsCol.doc(), {
-        userId: scheduledPayment.userId,
-        type: "scheduled_payment",
-        fromWalletId: scheduledPayment.fromWalletId,
-        amount: scheduledPayment.amount,
-        merchantName: scheduledPayment.payeeName,
-        note: scheduledPayment.note,
-        status: "failed",
-        createdAt: now,
-      });
-      t.set(notificationsCol.doc(), {
-        userId: scheduledPayment.userId,
-        title: "Scheduled payment failed",
-        message: `₹${Number(scheduledPayment.amount).toFixed(2)} to ${scheduledPayment.payeeName} could not be processed due to insufficient balance.`,
-        type: "schedule",
-        isRead: false,
-        createdAt: now,
-      });
-      return;
-    }
-
-    t.update(walletRef, { balance: Number(wallet.balance) - Number(scheduledPayment.amount) });
-
-    t.set(transactionsCol.doc(), {
+  if (scheduledPayment.reserved) {
+    // One-time payments already had their amount deducted (and held) when they were
+    // scheduled — just record the completed transaction, no further balance change.
+    await transactionsCol.doc().set({
       userId: scheduledPayment.userId,
       type: "scheduled_payment",
       fromWalletId: scheduledPayment.fromWalletId,
@@ -63,8 +38,7 @@ async function executePayment(scheduledPayment) {
       status: "success",
       createdAt: now,
     });
-
-    t.set(notificationsCol.doc(), {
+    await notificationsCol.doc().set({
       userId: scheduledPayment.userId,
       title: "Scheduled payment sent",
       message: `₹${Number(scheduledPayment.amount).toFixed(2)} sent to ${scheduledPayment.payeeName}.`,
@@ -72,9 +46,59 @@ async function executePayment(scheduledPayment) {
       isRead: false,
       createdAt: now,
     });
-  });
+  } else {
+    await db.runTransaction(async (t) => {
+      const walletSnap = await t.get(walletRef);
+      const wallet = walletSnap.exists ? docToObject(walletSnap) : null;
+
+      if (!wallet || Number(wallet.balance) < Number(scheduledPayment.amount)) {
+        t.set(transactionsCol.doc(), {
+          userId: scheduledPayment.userId,
+          type: "scheduled_payment",
+          fromWalletId: scheduledPayment.fromWalletId,
+          amount: scheduledPayment.amount,
+          merchantName: scheduledPayment.payeeName,
+          note: scheduledPayment.note,
+          status: "failed",
+          createdAt: now,
+        });
+        t.set(notificationsCol.doc(), {
+          userId: scheduledPayment.userId,
+          title: "Scheduled payment failed",
+          message: `₹${Number(scheduledPayment.amount).toFixed(2)} to ${scheduledPayment.payeeName} could not be processed due to insufficient balance.`,
+          type: "schedule",
+          isRead: false,
+          createdAt: now,
+        });
+        return;
+      }
+
+      t.update(walletRef, { balance: Number(wallet.balance) - Number(scheduledPayment.amount) });
+
+      t.set(transactionsCol.doc(), {
+        userId: scheduledPayment.userId,
+        type: "scheduled_payment",
+        fromWalletId: scheduledPayment.fromWalletId,
+        amount: scheduledPayment.amount,
+        merchantName: scheduledPayment.payeeName,
+        note: scheduledPayment.note,
+        status: "success",
+        createdAt: now,
+      });
+
+      t.set(notificationsCol.doc(), {
+        userId: scheduledPayment.userId,
+        title: "Scheduled payment sent",
+        message: `₹${Number(scheduledPayment.amount).toFixed(2)} sent to ${scheduledPayment.payeeName}.`,
+        type: "schedule",
+        isRead: false,
+        createdAt: now,
+      });
+    });
+  }
 
   const updates = { lastRunDate: today };
+  if (scheduledPayment.reserved) updates.reserved = false;
 
   if (scheduledPayment.scheduleType === "recurring") {
     const next = computeNextRunDate(scheduledPayment.nextRunDate, scheduledPayment.frequency);

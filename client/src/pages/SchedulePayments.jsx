@@ -27,7 +27,7 @@ function currentWeekDays() {
 }
 
 export default function SchedulePayments() {
-  const { scheduledPayments, wallets, refreshScheduledPayments } = useData();
+  const { scheduledPayments, wallets, refreshScheduledPayments, refreshWallets, refreshTransactions } = useData();
   const toast = useToast();
   const [showForm, setShowForm] = useState(false);
   const [editingPayment, setEditingPayment] = useState(null);
@@ -50,8 +50,12 @@ export default function SchedulePayments() {
   async function handleStatus(payment, status) {
     try {
       await updateScheduledPaymentStatus(payment.id, status);
-      await refreshScheduledPayments();
-      toast.success(`Payment ${status}`);
+      await Promise.all([refreshScheduledPayments(), refreshWallets(), refreshTransactions()]);
+      toast.success(
+        status === "cancelled" && payment.reserved
+          ? `Payment cancelled — ₹${Number(payment.amount).toFixed(2)} refunded to your Main Wallet`
+          : `Payment ${status}`
+      );
     } catch (err) {
       toast.error(err.message);
     }
@@ -61,7 +65,7 @@ export default function SchedulePayments() {
     setDeleting(true);
     try {
       await deleteScheduledPayment(deleteTarget.id);
-      await refreshScheduledPayments();
+      await Promise.all([refreshScheduledPayments(), refreshWallets(), refreshTransactions()]);
       toast.success("Scheduled payment removed");
       setDeleteTarget(null);
     } catch (err) {
